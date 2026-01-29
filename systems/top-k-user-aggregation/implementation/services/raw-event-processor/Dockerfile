@@ -1,0 +1,18 @@
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+COPY go.mod ./
+COPY go.sum* ./
+COPY . .
+RUN go mod tidy
+RUN CGO_ENABLED=0 go build -o raw-event-processor .
+
+FROM alpine:3.19
+WORKDIR /app
+COPY --from=builder /app/raw-event-processor .
+
+ENV KAFKA_BROKER=kafka:9092
+ENV CASSANDRA_HOSTS=cassandra:9042
+ENV CONSUMER_GROUP=raw-event-processor
+
+CMD ["./raw-event-processor"]

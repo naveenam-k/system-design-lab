@@ -16,7 +16,7 @@ create_topic() {
       --replication-factor "$replicas"
 }
 
-create_topic "crawl.jobs" 6 1
+# crawl.jobs removed — using Asynq (Redis) for job scheduling instead
 create_topic "user.listen.raw" 12 1
 
 echo "Topics created."

@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
@@ -8,6 +6,9 @@ services:
       ZOOKEEPER_TICK_TIME: "2000"
     ports:
       - "2181:2181"
+    volumes:
+      - /runtime/shared/system-design-lab/top_k_user_aggregation/zookeeper/data:/var/lib/zookeeper/data
+      - /runtime/shared/system-design-lab/top_k_user_aggregation/zookeeper/log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.6.1
@@ -24,6 +25,8 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
       KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    volumes:
+      - /runtime/shared/system-design-lab/top_k_user_aggregation/kafka:/var/lib/kafka/data
 
   postgres:
     image: postgres:16-alpine
@@ -34,7 +37,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - /runtime/shared/system-design-lab/top_k_user_aggregation/postgres:/var/lib/postgresql/data
 
   cassandra:
     image: cassandra:4.1
@@ -46,16 +49,78 @@ services:
     ports:
       - "9042:9042"
     volumes:
-      - cassandra_data:/var/lib/cassandra
+      - /runtime/shared/system-design-lab/top_k_user_aggregation/cassandra:/var/lib/cassandra
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data
+      - /runtime/shared/system-design-lab/top_k_user_aggregation/redis:/data
 
-volumes:
-  pg_data:
-  cassandra_data:
-  redis_data:
+  crawl-worker:
+    build:
+      context: ./services/crawl-worker
+      dockerfile: Dockerfile
+    depends_on:
+      - redis
+      - kafka
+    environment:
+      REDIS_ADDR: "redis:6379"
+      KAFKA_BROKER: "kafka:9092"
+    restart: unless-stopped
+
+  raw-event-processor:
+    build:
+      context: ./services/raw-event-processor
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+      - cassandra
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      CASSANDRA_HOSTS: "cassandra"
+      CONSUMER_GROUP: "raw-event-processor"
+    restart: unless-stopped
+
+  aggregator:
+    build:
+      context: ./services/aggregator
+      dockerfile: Dockerfile
+    depends_on:
+      - kafka
+      - cassandra
+    environment:
+      KAFKA_BROKER: "kafka:9092"
+      CASSANDRA_HOSTS: "cassandra"
+      CONSUMER_GROUP: "aggregator"
+      FLUSH_INTERVAL: "30s"
+    restart: unless-stopped
+
+  api-server:
+    build:
+      context: ./services/api-server
+      dockerfile: Dockerfile
+    depends_on:
+      - cassandra
+      - redis
+    ports:
+      - "8080:8080"
+    environment:
+      CASSANDRA_HOSTS: "cassandra"
+      REDIS_ADDR: "redis:6379"
+      PORT: "8080"
+      CACHE_TTL: "1h"
+    restart: unless-stopped
+
+  # One-off: enqueue a test crawl job
+  enqueue-test:
+    build:
+      context: ./services/crawl-worker
+      dockerfile: Dockerfile.enqueue-test
+    depends_on:
+      - redis
+    environment:
+      REDIS_ADDR: "redis:6379"
+    profiles:
+      - tools

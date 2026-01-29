@@ -1,0 +1,32 @@
+Infra
+Item	Status
+Docker Compose (Kafka, Zookeeper, Postgres, Cassandra, Redis)	✅ Done
+Kafka topic user.listen.raw	✅ Done (script ready)
+Cassandra keyspace + tables (UserListenHistory, UserDailyTopK)	❌ Pending
+Postgres schema (users, provider_links, user_crawl_schedule)	❌ Pending
+Services
+Item	Status
+OAuth adapter (Spotify + GitHub linking)	✅ Done (separate system)
+Crawl worker (Asynq + Kafka publish)	✅ Done
+Enqueue test CLI	✅ Done
+Raw event processor (Kafka → Cassandra)	❌ Pending
+Aggregator (Kafka → daily aggregates → Cassandra)	❌ Pending
+Top-K API server (GET /users/{id}/topk)	❌ Pending
+Data
+Item	Status
+Spotify Charts CSV ingestion script	❌ Pending
+Synthetic user event generator	❌ Pending
+Seed users in Postgres	❌ Pending
+Integration
+Item	Status
+Crawl worker → Kafka verified end-to-end	❌ Pending
+Raw event processor → Cassandra verified	❌ Pending
+Aggregator → Cassandra verified	❌ Pending
+Top-K API → Cache → Cassandra verified	❌ Pending
+Extras
+Item	Status
+Redis cache for Top-K results	❌ Pending
+Asynq dashboard (optional)	❌ Pending
+Observability (metrics, logs)	❌ Pending
+Load testing	❌ Pending
+Failure injection tests	❌ Pending
