@@ -53,12 +53,13 @@ services:
       - /runtime/shared/system-design-lab/top_k_user_aggregation/cassandra:/var/lib/cassandra
 
   redis:
-    image: redis:7-alpine
-    command: redis-server --appendonly yes
+    image: redis/redis-stack-server:latest
     ports:
       - "6379:6379"
     volumes:
       - /runtime/shared/system-design-lab/top_k_user_aggregation/redis:/data
+    environment:
+      - REDIS_ARGS=--appendonly yes
 
   # NEW: DB-backed scheduler for crawl jobs
   crawl-scheduler:
@@ -109,9 +110,11 @@ services:
     depends_on:
       - kafka
       - cassandra
+      - redis
     environment:
       KAFKA_BROKER: "kafka:9092"
       CASSANDRA_HOSTS: "cassandra"
+      REDIS_ADDR: "redis:6379"
       CONSUMER_GROUP: "aggregator"
       FLUSH_INTERVAL: "30s"
     restart: unless-stopped
@@ -124,11 +127,11 @@ services:
       - cassandra
       - redis
     ports:
-      - "8080:8080"
+      - "8081:8081"
     environment:
       CASSANDRA_HOSTS: "cassandra"
       REDIS_ADDR: "redis:6379"
-      PORT: "8080"
+      PORT: "8081"
       CACHE_TTL: "1h"
     restart: unless-stopped
 

@@ -282,8 +282,8 @@ def get_valid_spotify_access_token(
         provider_user_id, access_token, refresh_token, expires_at = row
     else:
         row = get_provider_link_by_provider_user("spotify", spotify_user_id or "")
-        if not row:
-            raise HTTPException(status_code=404, detail="spotify_user_id not linked")
+    if not row:
+        raise HTTPException(status_code=404, detail="spotify_user_id not linked")
         _app_user_id, access_token, refresh_token, expires_at = row
         provider_user_id = spotify_user_id or ""
 

@@ -18,11 +18,11 @@ A functional end-to-end system that:
 | Area | Lab Implementation | Why It's OK for Lab |
 |------|-------------------|---------------------|
 | Crawl jobs | **DB-backed scheduler with reconciliation** | ✅ Production-ready pattern |
-| Deduplication | None | Over-counting is acceptable per design doc |
-| Partition affinity | Not enforced | Counter columns handle concurrent writes |
-| Cache invalidation | TTL-only (5 min) | 1-day staleness is acceptable |
+| Deduplication | **Redis Bloom Filter + At-Most-Once** | ✅ Shared, multi-aggregator safe |
+| Partition affinity | ✅ Enforced via Kafka Key | Shared Bloom handles rebalancing edge cases |
+| Cache invalidation | TTL-only (5 min in lab) | Data changes daily, could use 1-6 hour TTL |
 | OAuth tokens | No refresh rotation | GitHub tokens are long-lived for demo |
-| Error handling | Log and continue | No production alerting needed |
+| Error handling | Log and continue | See "Error Handling: Lab vs Production" section below |
 | Metrics/Observability | None | Visual verification via logs |
 
 ---
@@ -109,6 +109,218 @@ WHERE user_id = ? AND provider = ?
 
 ---
 
+## Partition Affinity + Shared Bloom Filter (Defense in Depth)
+
+### How Partition Affinity Works
+
+```go
+// In crawl-worker/tasks/crawl.go
+msgs = append(msgs, kafka.Message{
+    Key:   []byte(e.UserID),  // ← Kafka routes by this key
+    Value: data,
+})
+```
+
+Kafka automatically hashes the key: `hash(UserID) % num_partitions → consistent partition`
+
+Result: **All events for the same user always go to the same partition → same aggregator.**
+
+### Mental Model: Why Both?
+
+```
+Normal case (99.9%):
+  Partition affinity via Key → Same aggregator → Local dedup would suffice
+  But Bloom Filter is cheap, so why not keep it?
+
+Edge cases (0.1%):
+  - Consumer rebalancing (scale up/down aggregators)
+  - Aggregator crash + restart mid-batch
+  - Kafka partition reassignment
+  
+  → Different aggregator might see replayed events
+  → Shared Redis Bloom Filter catches these
+
+Defense in Depth:
+  Partition affinity = efficient common path
+  Shared Bloom Filter = safety net for edge cases
+  Both together = robust deduplication
+```
+
+### Trade-off: Shared vs Local Bloom Filter
+
+| Aspect | Shared Redis Bloom | Local In-Memory Bloom |
+|--------|-------------------|----------------------|
+| Rebalancing safe | ✅ Yes | ❌ No (new aggregator has empty filter) |
+| Latency | ~1ms Redis call | ~0ms (memory) |
+| Memory | Redis server | Each aggregator instance |
+| Complexity | Medium | Low |
+
+**Our choice:** Shared Redis Bloom — handles all edge cases, ~1ms overhead acceptable.
+
+---
+
+## Error Handling: Lab vs Production Mental Model
+
+### Lab Approach: Log and Continue
+
+```go
+// Lab code pattern
+if err != nil {
+    log.Printf("Error: %v", err)
+    // continue processing...
+}
+```
+
+**Why it's OK for lab:** Visual debugging via logs, no SLA, manual intervention acceptable.
+
+### Production Mental Model: Classify → Handle → Alert → Recover
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 1: CLASSIFY THE ERROR                                             │
+│                                                                         │
+│  ┌─────────────────┬────────────────┬─────────────────────────────────┐│
+│  │ Type            │ Retryable?     │ Examples                        ││
+│  ├─────────────────┼────────────────┼─────────────────────────────────┤│
+│  │ Transient       │ ✅ Yes         │ Network timeout, DB busy        ││
+│  │ Permanent       │ ❌ No          │ Invalid data, auth failure      ││
+│  │ Dependency down │ ✅ Yes (later) │ Kafka unavailable, Redis down   ││
+│  │ Bug             │ ❌ No          │ Nil pointer, logic error        ││
+│  └─────────────────┴────────────────┴─────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 2: HANDLE APPROPRIATELY                                           │
+│                                                                         │
+│  Transient → Retry with exponential backoff (1s, 2s, 4s, 8s, max 30s)  │
+│  Permanent → Send to Dead Letter Queue (DLQ) + alert                   │
+│  Dependency down → Circuit breaker (fail fast) + health check          │
+│  Bug → Crash (let orchestrator restart) + alert immediately            │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 3: ALERT THE RIGHT PEOPLE                                         │
+│                                                                         │
+│  ┌──────────────────┬─────────────────┬───────────────────────────────┐│
+│  │ Severity         │ Response Time   │ Channel                       ││
+│  ├──────────────────┼─────────────────┼───────────────────────────────┤│
+│  │ Critical (P1)    │ < 5 min         │ PagerDuty → Phone call        ││
+│  │ High (P2)        │ < 30 min        │ Slack alert → On-call         ││
+│  │ Medium (P3)      │ < 4 hours       │ Ticket created                ││
+│  │ Low (P4)         │ Next sprint     │ Log aggregation only          ││
+│  └──────────────────┴─────────────────┴───────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 4: RECOVER (Graceful Degradation)                                 │
+│                                                                         │
+│  API Server: Redis down → Serve from Cassandra (slower, but works)     │
+│  Aggregator: Cassandra down → Buffer in memory (risk data loss)        │
+│  Crawl Worker: Kafka down → Return error, scheduler will retry         │
+│  All Services: Dependency flapping → Circuit breaker (stop trying)     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Production Patterns to Implement
+
+**1. Structured Error Context**
+```go
+// Bad (lab)
+log.Printf("Error writing to Cassandra: %v", err)
+
+// Good (production)
+log.Error("cassandra_write_failed",
+    "user_id", userID,
+    "song_id", songID,
+    "error", err.Error(),
+    "retry_count", retryCount,
+    "latency_ms", latency,
+)
+```
+
+**2. Retry with Backoff**
+```go
+// Exponential backoff for transient errors
+for attempt := 0; attempt < maxRetries; attempt++ {
+    err := doOperation()
+    if err == nil {
+        return nil
+    }
+    if !isRetryable(err) {
+        return err // Don't retry permanent errors
+    }
+    sleep := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+    time.Sleep(min(sleep, maxBackoff))
+}
+return sendToDLQ(item) // All retries exhausted
+```
+
+**3. Circuit Breaker**
+```go
+// Fail fast when dependency is unhealthy
+if circuitBreaker.IsOpen() {
+    return ErrServiceUnavailable // Don't even try
+}
+err := callDependency()
+if err != nil {
+    circuitBreaker.RecordFailure()
+} else {
+    circuitBreaker.RecordSuccess()
+}
+```
+
+**4. Dead Letter Queue (DLQ)**
+```
+Normal flow: Event → Process → Success
+Error flow:  Event → Process → Fail → Retry 3x → DLQ
+
+DLQ allows:
+  - Manual inspection of failed events
+  - Replay after bug fix
+  - Metrics on failure patterns
+```
+
+**5. Health Endpoints**
+```
+GET /healthz → Am I running? (liveness probe)
+GET /readyz  → Can I serve traffic? (readiness probe)
+
+Kubernetes uses these to:
+  - Restart unhealthy pods (liveness fails)
+  - Stop sending traffic (readiness fails)
+```
+
+### Alert Thresholds (What to Monitor)
+
+| Metric | Warning | Critical | Why |
+|--------|---------|----------|-----|
+| Kafka consumer lag | > 10K | > 100K | Processing falling behind |
+| Error rate | > 1% | > 5% | Something is broken |
+| p99 latency | > 500ms | > 2s | Performance degradation |
+| DLQ size | > 100 | > 1000 | Failures accumulating |
+| Cache hit rate | < 80% | < 50% | Cache not effective |
+| Disk usage | > 70% | > 85% | Running out of space |
+
+### Summary: Lab → Production Checklist
+
+```
+□ Replace log.Printf with structured logging (JSON)
+□ Add error classification (transient vs permanent)
+□ Implement retry with exponential backoff
+□ Add circuit breakers for external dependencies
+□ Set up DLQ for failed events
+□ Add /healthz and /readyz endpoints
+□ Configure alerting thresholds
+□ Create runbook for common failures
+□ Test graceful degradation paths
+□ Load test error scenarios
+```
+
+---
+
 ## Production Considerations
 
 ### 1. **Reliability & Durability**
@@ -132,11 +344,21 @@ WHERE user_id = ? AND provider = ?
 ### 3. **Data Integrity**
 
 ```
-Lab:      at-least-once delivery → possible over-counts
-Production options:
-  1. Exactly-once semantics (Kafka transactions)
-  2. Idempotent writes (event_id as Cassandra clustering key)
-  3. Deduplication window (Redis SET with TTL)
+Requirement: Over-counting NOT acceptable, few misses OK
+
+Implemented:
+  1. Redis Bloom Filter deduplication (shared across aggregators)
+     - Key per day: dedup:2026-01-30
+     - Capacity: 10M events/day, 0.1% false positive rate
+     - TTL: 8 days (auto-rotation)
+     - False positive → skip event → under-count (OK!)
+     - Multi-aggregator safe: all check the SAME bloom filter
+  
+  2. Order: BF.ADD → Cassandra → Commit Offset
+     - Crash after BF.ADD, before Cassandra → replay, bloom skips (under-count OK)
+     - Crash after Cassandra, before commit → replay, bloom skips (CORRECT! data persisted)
+     - Crash after commit → no replay (CORRECT!)
+     - Guarantees NO over-counting
 ```
 
 ### 4. **Observability (Must-Have for Production)**
@@ -209,6 +431,123 @@ Production options:
    - Time-series optimized store (ClickHouse, TimescaleDB) for analytics
    - Cassandra for serving, analytics DB for exploration
 
+#### Deep Dive: Pre-Aggregation at Crawl Worker
+
+```
+BEFORE (current - individual events):
+┌─────────────────────────────────────────────────────────────────┐
+│ Crawl Worker fetches 100 listen events for Alice                │
+│                                                                 │
+│ Publishes to Kafka:                                             │
+│   Event 1: {user: alice, song: X}                              │
+│   Event 2: {user: alice, song: X}                              │
+│   Event 3: {user: alice, song: X}                              │
+│   ... (100 individual events)                                   │
+└─────────────────────────────────────────────────────────────────┘
+              │
+              ▼ 100 Kafka messages
+              
+┌─────────────────────────────────────────────────────────────────┐
+│ Aggregator: Process 100 messages, accumulate, flush             │
+└─────────────────────────────────────────────────────────────────┘
+
+
+AFTER (pre-aggregation - summaries):
+┌─────────────────────────────────────────────────────────────────┐
+│ Crawl Worker fetches 100 listen events for Alice                │
+│                                                                 │
+│ Pre-aggregates locally:                                         │
+│   {user: alice, song: X, count: 3}                             │
+│   {user: alice, song: Y, count: 2}                             │
+│   ... (maybe 20 unique songs)                                   │
+│                                                                 │
+│ Publishes to Kafka:                                             │
+│   Summary 1: {user: alice, song: X, count: 3}                  │
+│   Summary 2: {user: alice, song: Y, count: 2}                  │
+│   ... (20 messages instead of 100)                              │
+└─────────────────────────────────────────────────────────────────┘
+              │
+              ▼ 20 Kafka messages (80% reduction!)
+              
+┌─────────────────────────────────────────────────────────────────┐
+│ Aggregator: Process 20 messages, much less work                 │
+└─────────────────────────────────────────────────────────────────┘
+
+Benefits:
+  - 80% fewer Kafka messages
+  - 80% less work for aggregator
+  - Network bandwidth savings
+  - Crawl worker has local data anyway, aggregation is cheap
+
+Trade-off:
+  - Slightly more complex crawl worker
+  - Loss of raw event granularity in Kafka (if needed for replay/debugging)
+```
+
+#### Deep Dive: Why Stream Processing (Flink/Spark) at Scale
+
+**Simple Kafka consumer limitations at 1B events/day (~11,500 events/sec):**
+
+```
+Simple Consumer (our current approach):
+┌─────────────────────────────────────────────────────────────────┐
+│  Problems at scale:                                             │
+│                                                                 │
+│  1. Memory: Each consumer holds state for its partition         │
+│     → OOM risk with billions of unique keys                     │
+│                                                                 │
+│  2. Checkpointing: Manual offset commit                         │
+│     → Crash between flush and commit = data loss or duplicates  │
+│                                                                 │
+│  3. Windowing: "Past 7 days" logic is manual                   │
+│     → Error-prone, late arrival handling is DIY                 │
+│                                                                 │
+│  4. Backpressure: No built-in flow control                      │
+│     → Cassandra slow? Consumer keeps reading → OOM              │
+│                                                                 │
+│  5. Scaling: Adding partitions requires rebalancing             │
+│     → State redistribution is manual                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**What Flink/Spark Streaming provide:**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. DISTRIBUTED STATE MANAGEMENT                                │
+│     State stored in RocksDB (disk-backed, not just memory)      │
+│     Can handle TB of state across cluster                       │
+│     Automatic state partitioning and redistribution             │
+│                                                                 │
+│  2. EXACTLY-ONCE CHECKPOINTING                                  │
+│     Framework snapshots state + offsets atomically              │
+│     Crash → restore from checkpoint → no data loss              │
+│     No manual offset management                                 │
+│                                                                 │
+│  3. BUILT-IN WINDOWING                                          │
+│     .window(TumblingWindow.of(Time.days(1)))                    │
+│     .aggregate(new CountAggregator())                           │
+│     Framework handles late arrivals, watermarks                 │
+│                                                                 │
+│  4. BACKPRESSURE                                                │
+│     If sink (Cassandra) is slow, framework slows down source    │
+│     Prevents OOM, no manual flow control needed                 │
+│                                                                 │
+│  5. DYNAMIC SCALING                                             │
+│     Add/remove workers without stopping pipeline                │
+│     State automatically redistributed                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**When to use what:**
+
+| Scale | Approach | Why |
+|-------|----------|-----|
+| < 1M events/day | Simple consumer | Low complexity, works fine |
+| 1M - 100M events/day | Pre-aggregation + simple consumer | Reduces load, still manageable |
+| 100M - 1B events/day | Flink/Spark Streaming | Need distributed state, checkpointing |
+| > 1B events/day | Flink + pre-aggregation + tiered storage | All optimizations needed |
+
 ---
 
 ## Key Learnings from This Build
@@ -222,6 +561,8 @@ Production options:
 - **DB + Asynq for job scheduling** — DB for durability, Asynq for execution
 - **Reconciliation pattern** — recovers from Redis failures automatically
 - **Kafka for event log** — durable, replayable, multiple consumers
+- **Kafka Key for partition affinity** — same user → same partition → same consumer
+- **Shared Bloom Filter** — defense in depth for rebalancing edge cases
 - **Cassandra counters have quirks** — no secondary indexes, no TTL on counters directly
 
 ### Development
@@ -230,16 +571,16 @@ Production options:
 - **Start with design doc** — prevents scope creep and rework
 
 ### What I'd Do Differently
-1. **Add structured logging from day 1** — debugging distributed systems is hard
-2. **Implement basic deduplication** — even a simple Redis SET helps
+1. ~~**Implement deduplication from day 1**~~ — ✅ Done (Bloom Filter + At-Most-Once)
+2. **Add structured logging from day 1** — debugging distributed systems is hard
 3. **Add health endpoints** — `/healthz` and `/readyz` for each service
 4. **Schema versioning** — track CQL changes in migration files
 
 ---
 
-## Interview Talking Points
+## Talking Points
 
-When discussing this system in interviews:
+When discussing this system:
 
 1. **Why pull-based ingestion?**
    - Third-party APIs don't push; we control crawl rate and backoff
@@ -251,7 +592,7 @@ When discussing this system in interviews:
 3. **How do you handle failures?**
    - DB-backed scheduler with reconciliation for lost jobs
    - Kafka consumer offsets for replay
-   - Cassandra counters for idempotent-ish increments
+   - Idempotent writes (event_id) to prevent over-counting on replay
    - Cache fallback to DB
 
 4. **How would you scale this?**
@@ -266,6 +607,7 @@ When discussing this system in interviews:
 
 ## Checklist: Before Going to Production
 
+- [x] **Deduplication implemented** (Redis Bloom Filter + At-Most-Once + Daily Rotation)
 - [ ] Kafka replication configured (RF ≥ 3)
 - [ ] Cassandra multi-node cluster (RF = 3)
 - [ ] Redis HA (Sentinel or Cluster)
