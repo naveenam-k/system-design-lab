@@ -35,6 +35,7 @@ After this document, coding can begin immediately.
 
 Single mono-repo for simplicity:
 
+```
 system-design-lab/
 ├── cmd/
 │   ├── oauth-service/
@@ -56,6 +57,7 @@ system-design-lab/
 │   ├── kafka/
 │   └── db/
 └── README.md
+```
 
 3. Services & Responsibilities
 3.1 OAuth Service
@@ -94,12 +96,13 @@ Periodic job (cron-like loop)
 
 Logic
 
+```sql
 UPDATE user_crawl_schedule
 SET status = 'ENQUEUED'
 WHERE next_crawl_at <= now()
   AND status = 'IDLE'
 RETURNING *;
-
+```
 
 Output
 
@@ -141,9 +144,11 @@ Updates crawl schedule after success
 
 Topics
 
-Topic	Purpose
-crawl.jobs	Crawl work queue
-user.listen.raw	Normalized listen events
+| Topic | Purpose |
+|-------|---------|
+| crawl.jobs | Crawl work queue |
+| user.listen.raw | Normalized listen events |
+
 3.5 Raw Event Processor
 
 Binary: raw-event-processor
@@ -246,7 +251,9 @@ Sort Top-K
 Cache response (Redis)
 
 4. Data Models (Code-Level)
-ListenEvent (Kafka)
+
+**ListenEvent (Kafka)**
+```json
 {
   "event_id": "uuid",
   "user_id": "string",
@@ -254,13 +261,16 @@ ListenEvent (Kafka)
   "provider": "spotify",
   "listened_at": "timestamp"
 }
+```
 
-CrawlJob (Kafka)
+**CrawlJob (Kafka)**
+```json
 {
   "user_id": "string",
   "provider": "spotify",
   "since": "timestamp"
 }
+```
 
 5. Configuration & Environment
 
